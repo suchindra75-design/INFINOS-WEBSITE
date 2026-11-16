@@ -5,6 +5,7 @@ import { Component, useEffect, useRef, useState, type ReactNode } from 'react'
 import { COOLANTS, COOLANT_FAMILY, COOLANT_STILLS } from '@/content/coolants'
 import { useExperienceStore } from '@/state/experienceStore'
 import { addRenderer, requestFrame } from '@/motion/frameLoop'
+import { whenScrollIdle } from '@/motion/scrollIdle'
 import { COVER_FROM, INFO_FROM, RETURN_BELOW, backdropAt, direction, familyAt, pickerAt, poolAt } from '@/motion/coolantMotion'
 import { setStageCovered } from '@/motion/stageCover'
 import { coolantRuntime as rt, measureSection, sectionScroll, useCoolantStore } from './coolantStore'
@@ -72,17 +73,15 @@ export function CoolantShowcase() {
     requestFrame()
   }, [reducedMotion])
 
-  // mount early, in an idle moment after the intro: the visitor is usually still on the hero, and everything is ready
-  // long before the bag story ends
+  // Mount early, long before the bag story ends — but after the bag's own live model is ready, and at a pause in
+  // scrolling (10 s at most; motion/scrollIdle.ts). It used to mount 1.2 s after the intro in an idle callback, the same
+  // moment the bag's model sets up, with a 4 s timeout that forced it through mid-swipe: its WebGL canvas, lighting and
+  // model landed as freezes of ~0.35-0.4 s on the visitor's first swipes (owner's device video, 2026-11-16).
+  const bagReady = useExperienceStore((s) => s.modelReady || s.modelFailed || !s.webglSupported)
   useEffect(() => {
-    if (!introReady || mounted) return
-    const w = window as Window & { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number; cancelIdleCallback?: (id: number) => void }
-    const t = window.setTimeout(() => {
-      if (w.requestIdleCallback) w.requestIdleCallback(() => setMounted(true), { timeout: 4000 })
-      else setMounted(true)
-    }, 1200)
-    return () => window.clearTimeout(t)
-  }, [introReady, mounted])
+    if (!introReady || !bagReady || mounted) return
+    return whenScrollIdle(() => setMounted(true), 10000)
+  }, [introReady, bagReady, mounted])
 
   useEffect(() => {
     const el = ref.current

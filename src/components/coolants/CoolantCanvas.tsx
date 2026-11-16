@@ -6,6 +6,7 @@ import { Suspense, memo, useEffect, useLayoutEffect, useMemo, useRef } from 'rea
 import * as THREE from 'three'
 import { applyRenderSettings } from '@/components/product/renderSettings'
 import { addRenderer, requestFrame } from '@/motion/frameLoop'
+import { whenScrollIdle } from '@/motion/scrollIdle'
 import { COOLANTS, COOLANT_CAP, type CoolantId } from '@/content/coolants'
 import {
   INFO_FROM,
@@ -413,11 +414,11 @@ function CoolantFan() {
         requestFrame()
       })
     }
-    const ric = (window as Window & { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number }).requestIdleCallback
-    if (ric) ric(run, { timeout: 1500 })
-    else setTimeout(run, 200)
+    // at a pause in scrolling, 3 s at most (motion/scrollIdle.ts): an idle callback with a timeout could fire mid-swipe
+    const cancel = whenScrollIdle(run, 3000)
     return () => {
       live = false
+      cancel()
     }
   }, [gl, scene, camera])
 

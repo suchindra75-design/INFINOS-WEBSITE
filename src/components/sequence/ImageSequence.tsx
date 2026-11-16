@@ -27,7 +27,7 @@ export const liveLayerRef: { current: HTMLDivElement | null } = { current: null 
 export const htmlPortal = liveLayerRef as unknown as React.RefObject<HTMLElement>
 
 /** the held opening frame's cross-fade to the live model once it is ready (ms) */
-const HOLD_FADE_MS = 450
+const HOLD_FADE_MS = 250
 
 /** a decoded neighbour within this many frames may stand in for the exact frame while it is being decoded */
 const MAX_FRAME_DISTANCE = 4
@@ -305,11 +305,15 @@ export function ImageSequence() {
     // whether the last tick showed a frame (see the fallback in draw)
     let showing = false
     const comp: Composition = { x: 0.5, y: 0.5, s: 1 }
-    const setLayers = (seq: number) => {
+    // The photo layer lies over the live one. While the photo fades, the live model is drawn underneath at full strength
+    // (it renders whenever it is not fully covered, liveLayer.ts) and only the photo dissolves: a cross-fade of two
+    // half-transparent layers let the floor show through both mid-way, and with a live canvas that had not presented its
+    // first frame yet it read as the bag vanishing for a moment (owner's device video, 2026-11-16).
+    const setLayers = (seq: number, liveOn = seq < 0.999) => {
       const o = String(seq)
       if (canvas.style.opacity !== o) canvas.style.opacity = o
       const live = liveLayerRef.current
-      const lo = String(1 - seq)
+      const lo = liveOn ? '1' : '0'
       if (live && live.style.opacity !== lo) live.style.opacity = lo
     }
     const setFrameOk = (ok: boolean) => {
@@ -318,7 +322,8 @@ export function ImageSequence() {
 
     // The reveal's hand-over frame, held while the live model is still on its way (see draw)
     let hold = 0
-    let holdFrom = 0
+    let holdFrom = -1
+    let settleTicks = 0
     let pendingBefore = false
     const setHeld = (held: boolean) => {
       if (useExperienceStore.getState().stageHeld !== held) useExperienceStore.setState({ stageHeld: held })
@@ -380,8 +385,15 @@ export function ImageSequence() {
       const pending = st.webglSupported && !st.modelFailed && !st.modelReady && st.introPhase === 'ready'
       if (pending) hold = 1
       else if (hold > 0) {
-        if (pendingBefore) holdFrom = now
-        hold = Math.max(0, 1 - (now - holdFrom) / HOLD_FADE_MS)
+        // the model is ready: it draws under the held frame for a few frames (so it has reached the screen), then the
+        // held frame dissolves over it
+        if (pendingBefore) {
+          holdFrom = -1
+          settleTicks = 0
+        }
+        if (holdFrom < 0) {
+          if (++settleTicks >= 3) holdFrom = now
+        } else hold = Math.max(0, 1 - (now - holdFrom) / HOLD_FADE_MS)
       }
       pendingBefore = pending
       const reveal = sets.reveal
@@ -399,7 +411,7 @@ export function ImageSequence() {
           setLayers(0)
           return
         }
-        setLayers(hold)
+        setLayers(hold, !pending)
         paint(reveal, held, sequenceLastCamera('reveal'), progress, w, h, cw, ch)
         // still fading: one more frame
         return hold > 0 && !pending
