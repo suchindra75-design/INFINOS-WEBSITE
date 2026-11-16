@@ -15,7 +15,8 @@ export function SmoothScrollProvider({ children }: { children: React.ReactNode }
   useEffect(() => {
     if (reducedMotion) return
     gsap.registerPlugin(ScrollTrigger)
-    const lenis = new Lenis({ lerp: 0.11 })
+    // 0.13 (was 0.11): the wheel settles a little sooner, so the page follows the hand more directly
+    const lenis = new Lenis({ lerp: 0.13 })
     lenisRef.current = lenis
     // the timed intro owns the first seconds: scrolling starts paused until it reports `ready` (IntroSequence)
     if (useExperienceStore.getState().introPhase !== 'ready') lenis.stop()

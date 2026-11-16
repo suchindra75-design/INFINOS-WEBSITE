@@ -14,7 +14,7 @@ import { addRenderer, requestFrame } from '@/motion/frameLoop'
  * moves, momentum, 60/90/120 Hz screens), so frames, model and text scrubbed straight from it stepped with every
  * report. The story is not attached to the finger (the stage is fixed), so the ease reads as glide, not as lag.
  */
-const TOUCH_EASE_MS = 90
+const TOUCH_EASE_MS = 75
 
 export function ScrollChapterController({
   targetRef,

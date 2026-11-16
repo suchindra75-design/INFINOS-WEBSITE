@@ -148,7 +148,8 @@ button {
 /* ── Layout ── */
 
 .narrative-spacer {
-  height: 1400vh;
+  /* 1400vh until 2026-11-16: the owner asked for a faster scroll — the same story in about 18% less scrolling */
+  height: 1150vh;
   pointer-events: none;
 }
 
@@ -4217,9 +4218,10 @@ html.stage-covered .ed * {
    animation as on desktop; the layout around them is arranged so nothing floats over the product or the copy.
    (motion/phoneLayout.ts uses this same media query.) */
 @media (max-aspect-ratio: 23/20) and (max-width: 699px) {
-  /* every chapter, in a little less scrolling than on desktop (1400vh): the story keeps its proportions */
+  /* every chapter, in a little less scrolling than on desktop (1150vh): the story keeps its proportions (1100vh until
+     2026-11-16, shortened with the desktop story for a faster scroll) */
   .narrative-spacer {
-    height: 1100vh;
+    height: 920vh;
   }
 
   /* the bar is frosted glacier glass (midnight glass before the studio is lit). Nothing passes under it any more — the
