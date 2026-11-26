@@ -29,6 +29,16 @@ export const htmlPortal = liveLayerRef as unknown as React.RefObject<HTMLElement
 /** the held opening frame's cross-fade to the live model once it is ready (ms) */
 const HOLD_FADE_MS = 250
 
+/**
+ * The live layer's opacity while the photoreal frames cover it, once the model is ready: invisible (under one 8-bit
+ * step even for white on black), but never 0. Each time a hidden WebGL canvas came back on screen, the browser's GPU
+ * process set its surface up again — traced at ~0.95 s in Chrome on a dual-GPU Mac (GLContextEGL::MakeCurrent under
+ * OnCreateSharedImage, as the GPU switched), independent of CPU speed — and the page froze for that long: on the first
+ * swipe from the top (967 ms at 4x CPU throttle) and where the live model takes over from the open frames (1.1-1.2 s).
+ * Kept on screen at this opacity the surface stays set up. The scene itself is not re-rendered while covered.
+ */
+const LIVE_HIDDEN_OPACITY = '0.002'
+
 /** a decoded neighbour within this many frames may stand in for the exact frame while it is being decoded */
 const MAX_FRAME_DISTANCE = 4
 
@@ -76,6 +86,12 @@ class FrameSet {
   private decoding = new Set<number>()
   private target = 0
   private dir = 1
+  /** scroll speed through this sequence (frames per second, signed), from the positions the story asked for */
+  private vel = 0
+  private lastAt = 0
+  private restTimer = 0
+  /** how long one frame takes to decode here (ms, running average), measured as frames arrive */
+  private decodeMs = 80
 
   constructor(
     readonly id: SequenceId,
@@ -141,8 +157,18 @@ class FrameSet {
 
   /** the frame the visitor is looking at; decoding follows it */
   want(i: number) {
+    const now = performance.now()
+    const dt = this.lastAt ? now - this.lastAt : 0
+    if (dt > 0 && dt < 250) {
+      const a = 1 - Math.exp(-dt / 90)
+      this.vel += (((i - this.target) * 1000) / dt - this.vel) * a
+    } else this.vel = 0
+    this.lastAt = now
     if (i !== this.target) this.dir = i > this.target ? 1 : -1
     this.target = i
+    // once the scroll has stopped (no frame asked for since), decode the frame it stopped on and its neighbours
+    window.clearTimeout(this.restTimer)
+    this.restTimer = window.setTimeout(() => this.pumpDecode(), 170)
     if (!this.blobs[i] && this.queue.includes(i)) {
       // visitor jumped ahead of the download: fetch the neighbourhood first
       const near = this.queue.filter((q) => Math.abs(q - i) <= 6).sort((a, b) => Math.abs(a - i) - Math.abs(b - i))
@@ -154,16 +180,50 @@ class FrameSet {
     this.pumpDecode()
   }
 
-  /** decode order around the target: ahead in the scroll direction first, a little behind for reversals */
+  /** the scroll speed now (frames per second); the story stops asking for frames once the page is at rest */
+  private velocity() {
+    return performance.now() - this.lastAt > 150 ? 0 : this.vel
+  }
+
+  /**
+   * Decode order. At rest (or scrolling slowly): the frame on screen, then its neighbours, ahead in the scroll direction
+   * first and a little behind for reversals. Scrolling faster than frames can be decoded (a 2560 px frame takes ~50-100
+   * ms; a quick scroll asks for 100+ frames a second), decoding the frame on screen and its next neighbours only ever
+   * finished frames the scroll had already passed, and the picture stuck on an old frame and jumped (measured: on
+   * average 8 frames behind, up to 23). Instead it decodes where the scroll will be when the decode finishes, at a
+   * spacing the decoder can keep up with, on a fixed grid so a frame chosen once stays chosen while the scroll goes on:
+   * the picture keeps moving with the scroll in slightly larger steps and settles on the exact frame when it stops.
+   */
   private priorities(): number[] {
-    const out: number[] = [this.target]
+    const n = this.def.frames
+    const v = this.velocity()
     const ahead = Math.max(2, Math.ceil(this.maxBitmaps * 0.65))
-    const behind = Math.max(1, this.maxBitmaps - 1 - ahead)
-    for (let k = 1; k <= ahead; k++) {
-      out.push(this.target + this.dir * k)
-      if (k <= behind) out.push(this.target - this.dir * k)
+    const lead = Math.round((v * this.decodeMs) / 1000)
+    const out: number[] = []
+    if (Math.abs(lead) <= 1) {
+      // the frame on screen and its nearest neighbours, then the rest of the sequence ahead at even spacing: a swipe
+      // from rest (the first one from the top of the page, most often) finds a decoded frame near every position at
+      // once, and the decoder fills in between as it goes
+      const t = this.target
+      const dir = this.dir
+      const near = 2
+      out.push(t)
+      for (let k = 1; k <= near; k++) out.push(t + dir * k, t - dir * k)
+      const room = dir > 0 ? n - 1 - t : t
+      const slots = ahead - near
+      if (room > near) for (let k = 1; k <= slots; k++) out.push(t + dir * (near + Math.round((k * (room - near)) / slots)))
+    } else {
+      const dir = lead > 0 ? 1 : -1
+      const perSecond = (this.concurrency * 1000) / this.decodeMs
+      const stride = Math.min(8, Math.max(1, Math.ceil(Math.abs(v) / perSecond)))
+      // first grid frame at or beyond where the scroll will be when a decode started now has finished
+      const from = this.target + lead
+      let g = dir > 0 ? Math.ceil(from / stride) * stride : Math.floor(from / stride) * stride
+      for (let k = 0; k < ahead && g >= 0 && g < n; k++, g += dir * stride) out.push(g)
+      // the end of the sequence (the hand-over frame) and the frame on screen, for when the scroll stops
+      out.push(dir > 0 ? n - 1 : 0, this.target)
     }
-    return out.filter((i) => i >= 0 && i < this.def.frames)
+    return out.filter((i) => i >= 0 && i < n)
   }
 
   private pumpDecode() {
@@ -174,9 +234,11 @@ class FrameSet {
       const blob = this.blobs[i]
       if (!blob) continue
       this.decoding.add(i)
+      const started = performance.now()
       decodeFrame(blob)
         .then((d) => {
           this.decoding.delete(i)
+          this.decodeMs += (performance.now() - started - this.decodeMs) * 0.2
           if (this.disposed) return d.close()
           this.bitmaps.set(i, d)
           this.evict()
@@ -190,9 +252,17 @@ class FrameSet {
     }
   }
 
+  /**
+   * over budget: frames the decode order no longer wants go first — those the scroll has passed before those still
+   * ahead of it — farthest first
+   */
   private evict() {
     if (this.bitmaps.size <= this.maxBitmaps) return
-    const far = [...this.bitmaps.keys()].sort((a, b) => Math.abs(b - this.target) - Math.abs(a - this.target))
+    const keep = new Set(this.priorities())
+    const rank = (i: number) => (keep.has(i) ? 2 : (i - this.target) * this.dir < 0 ? 0 : 1)
+    const far = [...this.bitmaps.keys()].sort(
+      (a, b) => rank(a) - rank(b) || Math.abs(b - this.target) - Math.abs(a - this.target),
+    )
     for (const i of far) {
       if (this.bitmaps.size <= this.maxBitmaps) break
       // frame 0 stays: it is the page's resting frame (First Light, and the top of the story)
@@ -225,6 +295,7 @@ class FrameSet {
 
   dispose() {
     this.disposed = true
+    window.clearTimeout(this.restTimer)
     for (const d of this.bitmaps.values()) d.close()
     this.bitmaps.clear()
   }
@@ -252,8 +323,11 @@ export function ImageSequence() {
     // the largest the film is ever drawn on this screen (composition.ts maxScale) decides the frame set
     const neededW = filmLayout(W, H, undefined, { x: 0.5, y: 0.5, s: maxScale(layoutMode(W, H)) }).w * dpr
     const variantFor = (def: SequenceDef): Variant => (neededW > (def.render?.mobileWidth ?? 960) * 1.05 ? 'desktop' : 'mobile')
-    // decoded-bitmap memory budget (RGBA): ~190 MB on desktop, ~70 MB on phones
-    const budget = (small ? 70 : 190) * 1024 * 1024
+    // decoded-bitmap memory budget (RGBA): ~70 MB on phones; on computers enough for ~24 full-size frames around the
+    // scroll position (~400 MB), so a quick scroll starts on frames that are already decoded — less where the browser
+    // reports little memory (navigator.deviceMemory, Chromium only)
+    const memory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory
+    const budget = (small ? 70 : memory !== undefined && memory < 8 ? 190 : 400) * 1024 * 1024
 
     const sets = {} as Record<SequenceId, FrameSet>
     const markOpeningReady = () => {
@@ -313,7 +387,8 @@ export function ImageSequence() {
       const o = String(seq)
       if (canvas.style.opacity !== o) canvas.style.opacity = o
       const live = liveLayerRef.current
-      const lo = liveOn ? '1' : '0'
+      // once the model is ready the layer is never fully hidden (see LIVE_HIDDEN_OPACITY)
+      const lo = liveOn ? '1' : useExperienceStore.getState().modelReady ? LIVE_HIDDEN_OPACITY : '0'
       if (live && live.style.opacity !== lo) live.style.opacity = lo
     }
     const setFrameOk = (ok: boolean) => {
