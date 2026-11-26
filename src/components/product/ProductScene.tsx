@@ -6,6 +6,7 @@ import { useExperienceStore } from '@/state/experienceStore'
 import { ProductFallback } from './ProductFallback'
 import { ImageSequence, liveLayerRef } from '@/components/sequence/ImageSequence'
 import { trackScrollIdle, whenScrollIdle } from '@/motion/scrollIdle'
+import { downloadModelBytes } from './modelBytes'
 
 const ProductCanvas = dynamic(() => import('./ProductCanvasInner').then((m) => m.ProductCanvasInner), {
   ssr: false,
@@ -22,6 +23,7 @@ const coarsePointer = () => typeof window !== 'undefined' && window.matchMedia('
 const LIVE_AFTER_READY = 1200
 
 const ModelLoadIndicator = dynamic(() => import('./ModelLoadIndicator'), { ssr: false })
+const ModelPrep = dynamic(() => import('./ModelPrep'), { ssr: false })
 
 /**
  * Two layers framed identically (film layout): the photoreal image sequence and the live 3D canvas underneath.
@@ -66,6 +68,29 @@ export function ProductScene() {
       cancel()
     }
   }, [intro, liveDue])
+  // The model's file downloads once the opening frames are in, and is parsed and merged ahead of the canvas (ModelPrep):
+  // while scrolling is still locked if it has arrived by the intro's last phase (the product fade-in, a compositor
+  // animation that a busy main thread cannot stall), otherwise at a pause in scrolling, 1.5 s at most.
+  const [bytes, setBytes] = useState(false)
+  // once due it stays mounted (the intro phase only ever moves forward)
+  const [prepLocked, setPrepLocked] = useState(false)
+  const [prepIdle, setPrepIdle] = useState(false)
+  if (bytes && intro === 'product' && !prepLocked) setPrepLocked(true)
+  const prepDue = prepLocked || prepIdle
+  useEffect(() => {
+    if (!webgl || modelFailed || bytes || !(openingReady || intro === 'ready')) return
+    let live = true
+    downloadModelBytes().then((ok) => {
+      if (live && ok) setBytes(true)
+    })
+    return () => {
+      live = false
+    }
+  }, [webgl, modelFailed, bytes, openingReady, intro])
+  useEffect(() => {
+    if (!bytes || prepDue || intro !== 'ready') return
+    return whenScrollIdle(() => setPrepIdle(true), 1500)
+  }, [bytes, prepDue, intro])
   const revealed = intro === 'product' || intro === 'ready'
   const mountModel =
     liveDue ||
@@ -84,6 +109,7 @@ export function ProductScene() {
       </div>
       <ImageSequence />
       {webgl && mountModel && <ModelLoadIndicator />}
+      {webgl && prepDue && !modelFailed && <ModelPrep />}
     </div>
   )
 }

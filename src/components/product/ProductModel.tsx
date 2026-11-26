@@ -5,7 +5,7 @@ import * as THREE from 'three'
 import { useGLTF } from '@react-three/drei'
 import { useThree } from '@react-three/fiber'
 import { PRODUCT } from '@/content/products'
-import { mergePartMeshes } from './mergeMeshes'
+import { isProductScenePrepared, takeProductScene } from './preparedScene'
 import { registerProductComponent, unregisterProductComponent } from './ProductComponentRegistry'
 import { LayerLabel } from './ComponentLabels'
 import { sensorTarget } from './TelemetryVisualization'
@@ -46,30 +46,74 @@ function findMaterialByName(object: THREE.Object3D, name: string): THREE.MeshSta
   return material
 }
 
+/**
+ * Uploads the model's textures to the GPU one at a time, each in a task of its own right after an animation frame (so it
+ * never lengthens a drawn frame), then calls `done`. Returns a cancel function.
+ */
+function uploadTexturesSpread(gl: THREE.WebGLRenderer, root: THREE.Object3D, done: () => void): () => void {
+  const list: THREE.Texture[] = []
+  const seen = new Set<THREE.Texture>()
+  root.traverse((o) => {
+    const mesh = o as THREE.Mesh
+    if (!mesh.isMesh) return
+    for (const m of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
+      for (const v of Object.values(m)) {
+        const tex = v as THREE.Texture | null
+        if (tex && tex.isTexture && !seen.has(tex)) {
+          seen.add(tex)
+          list.push(tex)
+        }
+      }
+    }
+  })
+  let i = 0
+  let raf = 0
+  let timer = 0
+  let live = true
+  const next = () => {
+    raf = requestAnimationFrame(() => {
+      timer = window.setTimeout(() => {
+        if (!live) return
+        if (i < list.length) {
+          gl.initTexture(list[i++])
+          next()
+        } else done()
+      }, 0)
+    })
+  }
+  next()
+  return () => {
+    live = false
+    cancelAnimationFrame(raf)
+    window.clearTimeout(timer)
+  }
+}
+
 /** parts that sit inside or against a shell, within its silhouette (see the shadow casters below) */
 const INNER_PARTS = /Zipper_|Screws|Velcro|Underside|Lining|Liner|_Pad_|Cable|BayItem/
 
 /**
- * The file is downloaded and parsed first (suspends); the private clone and merge below (a ~240 ms task on a throttled
- * phone) then wait for a pause in scrolling on touch screens, 1 s at most (motion/scrollIdle.ts).
+ * The file is downloaded and parsed first (suspends). The private merged copy is normally built ahead of time, during
+ * the intro (ModelPrep); if it is not, building it (a ~240 ms task on a throttled phone) waits for a pause in scrolling
+ * on touch screens, 1 s at most (motion/scrollIdle.ts).
  */
 function ProductModelInner() {
-  useGLTF(PRODUCT.model.source as string)
+  const gltf = useGLTF(PRODUCT.model.source as string)
+  // read once, on the first render after the file has loaded (taking the copy then clears it)
+  const [prepared] = useState(() => isProductScenePrepared(gltf))
   const [build, setBuild] = useState(false)
-  useEffect(() => whenScrollIdle(() => setBuild(true), 1000), [])
-  return build ? <ProductModelBody /> : null
+  useEffect(() => {
+    if (prepared) return
+    return whenScrollIdle(() => setBuild(true), 1000)
+  }, [prepared])
+  return build || prepared ? <ProductModelBody /> : null
 }
 
 function ProductModelBody() {
   const source = PRODUCT.model.source as string
   const gltf = useGLTF(source)
-  // a private clone with each part's same-material meshes merged into one draw (mergeMeshes.ts)
-  const cloned = useMemo(() => {
-    const c = gltf.scene.clone(true)
-    const { before, after } = mergePartMeshes(c, PRODUCT.modelComponents.map((s) => s.nodeName))
-    if (process.env.NODE_ENV !== 'production') console.info(`[product] draws per pass: ${before} -> ${after}`)
-    return c
-  }, [gltf])
+  // a private clone with each part's same-material meshes merged into one draw (mergeMeshes.ts, preparedScene.ts)
+  const cloned = useMemo(() => takeProductScene(gltf), [gltf])
   const rootRef = useRef<THREE.Group>(null!)
   const wrapperRefs = useRef(new Map<string, THREE.Group>())
   const restRef = useRef(new Map<string, { pos: THREE.Vector3; rot: THREE.Euler }>())
@@ -193,10 +237,13 @@ function ProductModelBody() {
       .then(() => {
         if (!live) return
         liveScene.compiled = true
-        // the first render uploads every texture (the longest single task of the set-up): at a pause on touch screens,
-        // 1 s at most. `modelReady` follows that render (ProductCanvasInner FrameLoopBridge), so the stage's held frame
-        // only hands over to a model that is fully on the GPU.
-        cancelWarm = whenScrollIdle(requestWarmRender, 1000)
+        // The textures go up one per frame first, each right after a frame has been drawn: uploaded all together by the
+        // first render they were the longest single task of the set-up (~300 ms at 4x CPU throttle, mid-swipe). Then the
+        // first render (buffers, the rest): at a pause on touch screens, 1 s at most. `modelReady` follows that render
+        // (ProductCanvasInner FrameLoopBridge), so the stage's held frame only hands over to a model fully on the GPU.
+        cancelWarm = uploadTexturesSpread(gl, cloned, () => {
+          cancelWarm = whenScrollIdle(requestWarmRender, 1000)
+        })
       })
 
     return () => {

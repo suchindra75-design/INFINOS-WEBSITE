@@ -14,7 +14,22 @@ import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js
  * Runs once on the product's private clone: the cached glTF (shared with the 360° viewer) is never modified.
  */
 
-/** float copies of every attribute (the file is quantized: int16 / int8 attributes with per-node scale) */
+/** the value three.js's getX() returns for one element of a normalized integer array (MathUtils.denormalize) */
+function denormalizer(array: ArrayLike<number>): ((v: number) => number) | null {
+  if (array instanceof Int16Array) return (v) => Math.max(v / 32767, -1)
+  if (array instanceof Int8Array) return (v) => Math.max(v / 127, -1)
+  if (array instanceof Uint16Array) return (v) => v / 65535
+  if (array instanceof Uint8Array) return (v) => v / 255
+  if (array instanceof Uint32Array) return (v) => v / 4294967295
+  if (array instanceof Int32Array) return (v) => Math.max(v / 2147483647, -1)
+  return null
+}
+
+/**
+ * float copies of every attribute (the file is quantized: int16 / int8 attributes with per-node scale). Plain arrays are
+ * read directly — identical values to getX()..getW(), which cost ~130 ms here on a throttled phone through their generic
+ * per-call checks; interleaved attributes keep the generic path.
+ */
 function floatGeometry(src: THREE.BufferGeometry): THREE.BufferGeometry {
   const geo = new THREE.BufferGeometry()
   for (const name of Object.keys(src.attributes)) {
@@ -22,16 +37,26 @@ function floatGeometry(src: THREE.BufferGeometry): THREE.BufferGeometry {
     const n = a.count
     const size = a.itemSize
     const out = new Float32Array(n * size)
-    for (let i = 0; i < n; i++) {
-      // getX..getW de-normalize normalized integer attributes
-      out[i * size] = a.getX(i)
-      if (size > 1) out[i * size + 1] = a.getY(i)
-      if (size > 2) out[i * size + 2] = a.getZ(i)
-      if (size > 3) out[i * size + 3] = a.getW(i)
+    if (!(a as THREE.InterleavedBufferAttribute).isInterleavedBufferAttribute && (a.array as ArrayLike<number>).length === n * size) {
+      const arr = a.array as ArrayLike<number>
+      const f = a.normalized ? denormalizer(arr) : null
+      if (f) for (let k = 0; k < out.length; k++) out[k] = f(arr[k])
+      else for (let k = 0; k < out.length; k++) out[k] = arr[k]
+    } else {
+      for (let i = 0; i < n; i++) {
+        // getX..getW de-normalize normalized integer attributes
+        out[i * size] = a.getX(i)
+        if (size > 1) out[i * size + 1] = a.getY(i)
+        if (size > 2) out[i * size + 2] = a.getZ(i)
+        if (size > 3) out[i * size + 3] = a.getW(i)
+      }
     }
     geo.setAttribute(name, new THREE.BufferAttribute(out, size))
   }
-  if (src.index) geo.setIndex(Array.from(src.index.array as ArrayLike<number>))
+  if (src.index) {
+    const ia = src.index.array as Uint16Array | Uint32Array
+    geo.setIndex(new THREE.BufferAttribute(ia.slice(), 1))
+  }
   return geo
 }
 
