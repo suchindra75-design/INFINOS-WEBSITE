@@ -29,7 +29,7 @@ const table = EDGES as unknown as Record<string, number[][]>
  * (willReadFrequently): a tiny GPU canvas drawn into the frame canvas stalls on a GPU round trip on every draw.
  */
 type Edge = 'top' | 'bottom' | 'left' | 'right'
-const strips = new Map<Edge, { canvas: HTMLCanvasElement; source: CanvasImageSource | null }>()
+const strips = new Map<Edge, { canvas: HTMLCanvasElement; frame: string }>()
 const bands = new Map<string, HTMLCanvasElement>()
 const soft = (w: number, h: number) => {
   const canvas = Object.assign(document.createElement('canvas'), { width: w, height: h })
@@ -38,15 +38,16 @@ const soft = (w: number, h: number) => {
 }
 
 /** the edge's outer DEPTH source pixels, area-averaged down to STEPS samples across (once per frame and edge) */
-function strip(edge: Edge, source: CanvasImageSource, sx: number, sy: number, bw: number, bh: number) {
+function strip(edge: Edge, frame: string, source: CanvasImageSource, sx: number, sy: number, bw: number, bh: number) {
   const horizontal = edge === 'top' || edge === 'bottom'
   let s = strips.get(edge)
   if (!s) {
-    s = { canvas: soft(horizontal ? STEPS : 1, horizontal ? 1 : STEPS), source: null }
+    s = { canvas: soft(horizontal ? STEPS : 1, horizontal ? 1 : STEPS), frame: '' }
     strips.set(edge, s)
   }
-  if (s.source === source) return s.canvas
-  s.source = source
+  // keyed by the frame, not the source object: in WebKit every frame is drawn from the same staging canvas
+  if (s.frame === frame) return s.canvas
+  s.frame = frame
   // copied 1:1 first, then averaged: resampling straight from the 2560 px frame would pass over the whole frame
   const key = `${bw}x${bh}`
   let band = bands.get(key)
@@ -74,6 +75,7 @@ export function extendFilmEdges(ctx: CanvasRenderingContext2D, source: CanvasIma
   const sw = (source as ImageBitmap).width
   const sh = (source as ImageBitmap).height
   if (!sw || !sh) return
+  const frame = `${sequenceId}:${index}:${sw}`
   const reach = Math.min(W, H) * 0.28
 
   const fade = (x0: number, y0: number, x1: number, y1: number, rx: number, ry: number, rw: number, rh: number) => {
@@ -88,7 +90,7 @@ export function extendFilmEdges(ctx: CanvasRenderingContext2D, source: CanvasIma
   // a horizontal edge (top or bottom): its shadow profile across the film, continued sideways to the screen edges
   const horizontal = (edge: Edge, sy: number, dy: number, dh: number, toward: number) => {
     if (dh <= 0) return
-    const across = strip(edge, source, 0, sy, sw, DEPTH)
+    const across = strip(edge, frame, source, 0, sy, sw, DEPTH)
     ctx.drawImage(across, 0, 0, STEPS, 1, x, dy, w, dh)
     if (x > 0) ctx.drawImage(across, 0, 0, 1, 1, 0, dy, x, dh)
     if (x + w < W) ctx.drawImage(across, STEPS - 1, 0, 1, 1, x + w, dy, W - (x + w), dh)
@@ -100,7 +102,7 @@ export function extendFilmEdges(ctx: CanvasRenderingContext2D, source: CanvasIma
   }
   const vertical = (edge: Edge, sx: number, dx: number, dw: number, toward: number) => {
     if (dw <= 0) return
-    const down = strip(edge, source, sx, 0, DEPTH, sh)
+    const down = strip(edge, frame, source, sx, 0, DEPTH, sh)
     ctx.drawImage(down, 0, 0, 1, STEPS, dx, y, dw, h)
     const edgeX = toward > 0 ? dx : dx + dw
     fade(edgeX, 0, edgeX + toward * reach, 0, dx, y, dw, h)

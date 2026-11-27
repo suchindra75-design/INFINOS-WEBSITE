@@ -10,6 +10,7 @@ import { SEQUENCES, filmLayout, sequenceFrame, sequenceGain, sequenceLastCamera,
 import { extendFilmEdges } from './filmEdges'
 import { PHONE_QUERY } from '@/motion/phoneLayout'
 import { stageSize } from '@/hooks/environment'
+import { decodeToPixels, isStaged, isWebKit, pixelDecoderBroken, stagePixels } from './pixelDecoder'
 
 type Variant = 'desktop' | 'mobile'
 
@@ -42,31 +43,61 @@ const LIVE_HIDDEN_OPACITY = '0.002'
 /** a decoded neighbour within this many frames may stand in for the exact frame while it is being decoded */
 const MAX_FRAME_DISTANCE = 4
 
+/**
+ * WebKit: copying a new frame's pixels in costs ~7-18 ms of the page's frame (more while the GPU is busy). In a quick
+ * scroll the frame changes on almost every screen frame, and copies on consecutive frames left no screen frame on time.
+ * A new frame is copied in at most once per this many ms; in between, the frame already copied in stays (it is within a
+ * few frames of the right one) while the composition keeps moving with the scroll every frame.
+ */
+const COPY_SPACING_MS = 24
+
 interface Decoded {
-  source: CanvasImageSource
+  /** what to draw this frame from (in WebKit: the staging canvas, after copying this frame's pixels into it) */
+  source: () => CanvasImageSource
   close: () => void
+  /** WebKit: whether this frame's pixels are already in the staging canvas (drawing it costs no copy) */
+  staged?: () => boolean
 }
+
+const webkit = isWebKit()
 
 /**
  * Decode a compressed frame OFF the main thread. Drawing an <img> into a canvas makes Chrome decode the 2560 px WebP
  * synchronously inside the frame commit (~70 ms per new frame — the cause of the old scroll stutter); createImageBitmap
  * decodes on a worker thread. Frames are decoded at their native size on purpose: resize options make Chrome scale the
  * bitmap on the main thread (~50 ms per frame on phones), so each screen loads the frame set closest to its needs.
+ * WebKit does both the decode and the first draw on the main thread instead; there frames become raw pixels in
+ * workers (pixelDecoder.ts).
  */
-async function decodeFrame(blob: Blob): Promise<Decoded> {
-  if (typeof createImageBitmap === 'function') {
+async function decodeFrame(blob: Blob, workers: number): Promise<Decoded> {
+  if (webkit && !pixelDecoderBroken()) {
+    try {
+      let pixels: ImageData | null = await decodeToPixels(blob, workers)
+      return {
+        source: () => stagePixels(pixels as ImageData),
+        staged: () => !!pixels && isStaged(pixels),
+        close: () => {
+          pixels = null
+        },
+      }
+    } catch {
+      // no OffscreenCanvas in workers: decode on the page (below)
+    }
+  }
+  if (typeof createImageBitmap === 'function' && !webkit) {
     try {
       const bmp = await createImageBitmap(blob)
-      return { source: bmp, close: () => bmp.close() }
+      return { source: () => bmp, close: () => bmp.close() }
     } catch {
       // fall through (engines without Blob support in createImageBitmap)
     }
   }
+  // (WebKit's img.decode() at least decodes off the main thread; its createImageBitmap does not)
   const url = URL.createObjectURL(blob)
   const img = new Image()
   img.src = url
   await img.decode()
-  return { source: img, close: () => URL.revokeObjectURL(url) }
+  return { source: () => img, close: () => URL.revokeObjectURL(url) }
 }
 
 /**
@@ -235,7 +266,7 @@ class FrameSet {
       if (!blob) continue
       this.decoding.add(i)
       const started = performance.now()
-      decodeFrame(blob)
+      decodeFrame(blob, this.concurrency)
         .then((d) => {
           this.decoding.delete(i)
           this.decodeMs += (performance.now() - started - this.decodeMs) * 0.2
@@ -321,8 +352,15 @@ export function ImageSequence() {
     const H = window.innerHeight
     const small = Math.min(W, H) < 700
     // the largest the film is ever drawn on this screen (composition.ts maxScale) decides the frame set
-    const neededW = filmLayout(W, H, undefined, { x: 0.5, y: 0.5, s: maxScale(layoutMode(W, H)) }).w * dpr
-    const variantFor = (def: SequenceDef): Variant => (neededW > (def.render?.mobileWidth ?? 960) * 1.05 ? 'desktop' : 'mobile')
+    const mode = layoutMode(W, H)
+    const neededW = filmLayout(W, H, undefined, { x: 0.5, y: 0.5, s: maxScale(mode) }).w * dpr
+    // Phones always take the 1600 px set. The common 412 px-wide Android screen (and 430 px phones) needs ~1690-1760 px,
+    // just over the cut-off, and so loaded the 2560 px set: frames 2.5x slower to decode, twice the download, and the
+    // phone's decode budget held only the minimum 6 of them — the reveal lagged 3-6 frames behind the swipe (up to 16)
+    // on exactly those phones, against about 1 with the 1600 px set (Chrome, 4x CPU slowdown). Drawn ≤10 % larger than
+    // its pixels on a 2.6-3x screen, the 1600 px frame looks the same (SSIM ≥ 0.993 against the 2560 px one).
+    const variantFor = (def: SequenceDef): Variant =>
+      mode !== 'phone' && neededW > (def.render?.mobileWidth ?? 960) * 1.05 ? 'desktop' : 'mobile'
     // decoded-bitmap memory budget (RGBA): ~70 MB on phones; on computers enough for ~24 full-size frames around the
     // scroll position (~400 MB), so a quick scroll starts on frames that are already decoded — less where the browser
     // reports little memory (navigator.deviceMemory, Chromium only)
@@ -376,6 +414,9 @@ export function ImageSequence() {
     }, 250)
 
     let lastKey = ''
+    // WebKit copy pacing (COPY_SPACING_MS): the frame last drawn, and when a frame was last copied in
+    let lastDrawn: { set: FrameSet; frame: Decoded; index: number } | null = null
+    let lastCopyAt = -1e9
     // whether the last tick showed a frame (see the fallback in draw)
     let showing = false
     const comp: Composition = { x: 0.5, y: 0.5, s: 1 }
@@ -420,9 +461,10 @@ export function ImageSequence() {
       // frames are decoded at (about) the drawn size, so plain GPU bilinear filtering is visually identical to
       // 'high' — which costs a slow resampling pass on every draw and dropped frames while scrubbing
       ctx.imageSmoothingQuality = 'low'
-      ctx.drawImage(found.frame.source, x, y, fw, fh)
+      const source = found.frame.source()
+      ctx.drawImage(source, x, y, fw, fh)
       // on the lit studio floor the frame's shadow must not end at the film edge (filmEdges.ts)
-      extendFilmEdges(ctx, found.frame.source, set.id, found.index, x, y, fw, fh)
+      extendFilmEdges(ctx, source, set.id, found.index, x, y, fw, fh)
       // exposure match for the first open frames (sequences.json displayGainKeys): darken the drawn pixels only,
       // inside the canvas — a CSS filter on this full-screen layer would cost a GPU filter pass every frame
       const gain = sequenceGain(set.def, found.index / Math.max(1, set.def.frames - 1))
@@ -502,14 +544,23 @@ export function ImageSequence() {
       // farther decoded frame stands in for the few ms until the right one arrives. Dropping to the live model for those
       // ms swapped the photo for a differently lit render and back — a visible flicker on phones, which decode slowly
       // and keep few frames (owner's device video, 2026-11-11).
-      const found = set.nearest(index) ?? (showing ? set.closest(index) : null)
+      let found = set.nearest(index) ?? (showing ? set.closest(index) : null)
       showing = !!found
+      let again = false
+      if (found?.frame.staged && !found.frame.staged()) {
+        const prev = lastDrawn
+        if (now - lastCopyAt < COPY_SPACING_MS && prev && prev.set === set && set.bitmaps.get(prev.index) === prev.frame && Math.abs(prev.index - index) <= MAX_FRAME_DISTANCE) {
+          found = { frame: prev.frame, index: prev.index, distance: Math.abs(prev.index - index) }
+          again = true
+        } else lastCopyAt = now
+      }
       setFrameOk(!!found)
       // the reveal's own hand-over to the live model waits for the model as well (the held frame above continues it)
       setLayers(found ? Math.max(sequenceCover, sequenceId === 'reveal' ? hold : 0) : 0)
       if (!found) return
       paint(set, found, cameraAt(chapter.phase, cp), progress, w, h, cw, ch)
-      return hold > 0 && !pending
+      lastDrawn = { set, frame: found.frame, index: found.index }
+      return (hold > 0 && !pending) || again
     }
 
     const unregister = addRenderer(draw, 20)
